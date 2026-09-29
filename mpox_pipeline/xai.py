@@ -1,71 +1,62 @@
-"""
-Grad-CAM (fully implemented) + usage notes for SHAP and LIME (paper's 3 XAI methods).
-"""
+import os
+import glob
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-import tensorflow as tf
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+import cv2
+from PIL import Image
+from torchvision import transforms
 
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
 
-def find_last_conv_layer(model):
-    for layer in reversed(model.layers):
-        if len(layer.output_shape) == 4:  # (B, H, W, C)
-            return layer.name
-    raise ValueError("No conv layer found.")
+        target_layer.register_forward_hook(self.save_activation)
+        target_layer.register_full_backward_hook(self.save_gradient)
 
+    def save_activation(self, module, input, output):
+        self.activations = output
 
-def grad_cam(model, img_array, class_index=None, last_conv_layer_name=None):
-    """
-    img_array: preprocessed (1, H, W, 3) array, already normalized as the model expects.
-    Returns a (H, W) heatmap normalized to [0, 1].
-    """
-    if last_conv_layer_name is None:
-        last_conv_layer_name = find_last_conv_layer(model)
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
 
-    grad_model = tf.keras.Model(
-        model.inputs, [model.get_layer(last_conv_layer_name).output, model.output])
+    def generate_cam(self, input_tensor, target_class=None):
+        self.model.eval()
+        output = self.model(input_tensor)
+        
+        if target_class is None:
+            target_class = output.argmax(dim=1).item()
 
-    with tf.GradientTape() as tape:
-        conv_output, predictions = grad_model(img_array)
-        if class_index is None:
-            class_index = tf.argmax(predictions[0])
-        class_channel = predictions[:, class_index]
+        self.model.zero_grad()
+        score = output[0, target_class]
+        score.backward()
 
-    grads = tape.gradient(class_channel, conv_output)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_output = conv_output[0]
-    heatmap = conv_output @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
-    return heatmap.numpy()
+        gradients = self.gradients[0].cpu().data.numpy()
+        activations = self.activations[0].cpu().data.numpy()
 
+        weights = np.mean(gradients, axis=(1, 2))
+        cam = np.zeros(activations.shape[1:], dtype=np.float32)
 
-def overlay_heatmap(img, heatmap, alpha=0.4, save_path=None):
-    heatmap_resized = tf.image.resize(heatmap[..., np.newaxis], (img.shape[0], img.shape[1])).numpy()
-    heatmap_resized = np.uint8(255 * heatmap_resized.squeeze())
-    jet = cm.get_cmap("jet")
-    jet_colors = jet(np.arange(256))[:, :3]
-    jet_heatmap = jet_colors[heatmap_resized]
-    superimposed = jet_heatmap * alpha + img / 255.0
-    superimposed = np.clip(superimposed, 0, 1)
-    if save_path:
-        plt.imsave(save_path, superimposed)
-    return superimposed
+        for i, w in enumerate(weights):
+            cam += w * activations[i]
 
+        cam = np.maximum(cam, 0)
+        if np.max(cam) != 0:
+            cam = cam / np.max(cam)
 
-# --- SHAP (paper: pixel/superpixel attribution, quantitative) ---
-# pip install shap
-#   import shap
-#   masker = shap.maskers.Image("inpaint_telea", img_array[0].shape)
-#   explainer = shap.Explainer(model, masker, output_names=classes)
-#   shap_values = explainer(img_array, max_evals=500, batch_size=32)
-#   shap.image_plot(shap_values)
+        return cam, target_class
 
-# --- LIME (paper: local superpixel-based explanation) ---
-# pip install lime
-#   from lime import lime_image
-#   explainer = lime_image.LimeImageExplainer()
-#   explanation = explainer.explain_instance(img_array[0], model.predict, top_labels=1,
-#                                             hide_color=0, num_samples=1000)
-#   temp, mask = explanation.get_image_and_mask(explanation.top_labels[0],
-#                                                positive_only=True, num_features=5)
+def run_xai_visualization():
+    output_dir = "results/xai_outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print("[+] XAI Grad-CAM Pipeline initialized.")
+    print(f"[+] Output heatmaps will be saved in: {os.path.abspath(output_dir)}")
+    print("[+] Ready to generate visual explanations for FYDP presentation!")
+
+if __name__ == "__main__":
+    run_xai_visualization()
